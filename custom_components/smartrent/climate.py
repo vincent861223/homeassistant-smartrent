@@ -11,8 +11,10 @@ from homeassistant.components.climate.const import (
     HVACMode,
 )
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceEntryType
 from smartrent import Thermostat
+from smartrent.utils import SmartRentError
 
 from .const import CONFIGURATION_URL, DOMAIN, PROPER_NAME
 
@@ -63,6 +65,15 @@ class SmartrentThermostat(ClimateEntity):
     def should_poll(self):
         """Return the polling state, if needed."""
         return False
+
+    @property
+    def available(self) -> bool:
+        """SmartRent reports the device offline while the hub is unreachable.
+
+        Without this the entity keeps showing a stale setpoint during a hub
+        outage, which makes a dead integration look perfectly healthy.
+        """
+        return bool(self.device.get_online())
 
     @property
     def unique_id(self):
@@ -154,11 +165,21 @@ class SmartrentThermostat(ClimateEntity):
         """Return the list of available operation modes."""
         return SUPPORT_HVAC
 
+    async def _async_send(self, what: str, coro) -> None:
+        """Await a device setter, surfacing delivery failures to the caller."""
+        try:
+            await coro
+        except SmartRentError as err:
+            raise HomeAssistantError(f"{self.name}: {what} failed: {err}") from err
+
     async def async_set_hvac_mode(self, hvac_mode):
         """Set new target operation mode."""
         smartrent_hvac_mode = HA_HVAC_MODE_TO_SMARTRENT.get(hvac_mode)
 
-        await self.device.async_set_mode(smartrent_hvac_mode)
+        await self._async_send(
+            f"set hvac_mode={hvac_mode}",
+            self.device.async_set_mode(smartrent_hvac_mode),
+        )
 
     @property
     def hvac_action(self) -> Optional[HVACAction]:
@@ -169,17 +190,29 @@ class SmartrentThermostat(ClimateEntity):
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature:
             if self.device.get_mode() == "cool":
-                await self.device.async_set_cooling_setpoint(temperature)
+                await self._async_send(
+                    f"set cooling_setpoint={temperature}",
+                    self.device.async_set_cooling_setpoint(temperature),
+                )
             else:
-                await self.device.async_set_heating_setpoint(temperature)
+                await self._async_send(
+                    f"set heating_setpoint={temperature}",
+                    self.device.async_set_heating_setpoint(temperature),
+                )
 
         tt_high = kwargs.get("target_temp_high")
         if tt_high:
-            await self.device.async_set_cooling_setpoint(tt_high)
+            await self._async_send(
+                f"set cooling_setpoint={tt_high}",
+                self.device.async_set_cooling_setpoint(tt_high),
+            )
 
         tt_low = kwargs.get("target_temp_low")
         if tt_low:
-            await self.device.async_set_heating_setpoint(tt_low)
+            await self._async_send(
+                f"set heating_setpoint={tt_low}",
+                self.device.async_set_heating_setpoint(tt_low),
+            )
 
     @property
     def fan_mode(self):
@@ -192,7 +225,10 @@ class SmartrentThermostat(ClimateEntity):
         """Set fan mode."""
         smartrent_fan_mode = HA_FAN_TO_SMART_RENT.get(fan_mode)
 
-        await self.device.async_set_fan_mode(smartrent_fan_mode)
+        await self._async_send(
+            f"set fan_mode={fan_mode}",
+            self.device.async_set_fan_mode(smartrent_fan_mode),
+        )
 
     @property
     def fan_modes(self):
