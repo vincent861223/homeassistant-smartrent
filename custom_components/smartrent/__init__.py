@@ -4,7 +4,7 @@ Custom integration to integrate integration_blueprint with Home Assistant.
 For more details about this integration, please refer to
 https://github.com/custom-components/integration_blueprint
 """
-import asyncio
+
 import logging
 
 from aiohttp.client_exceptions import ClientConnectorError
@@ -24,12 +24,17 @@ from .const import (
     PLATFORMS,
     STARTUP_MESSAGE,
 )
+from .patches import apply_patches
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up this integration using UI."""
+    # Fixes for smartrent-py 0.5.2 live in patches.py rather than in
+    # site-packages so they survive container image updates.
+    apply_patches()
+
     if hass.data.get(DOMAIN) is None:
         hass.data.setdefault(DOMAIN, {})
         _LOGGER.info(STARTUP_MESSAGE)
@@ -52,31 +57,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    entry.add_update_listener(async_reload_entry)
+    # Registered via async_on_unload so a reload does not stack a second copy.
+    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Handle removal of an entry."""
-    unloaded = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(entry, platform)
-                for platform in PLATFORMS
-            ]
-        )
-    )
-    api: API = hass.data[DOMAIN][entry.entry_id]
-    for device in api.get_device_list():
-        device.stop_updater()
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     if unloaded:
-        hass.data[DOMAIN].pop(entry.entry_id)
+        api: API = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+        if api is not None:
+            for device in api.get_device_list():
+                device.stop_updater()
 
     return unloaded
 
 
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload config entry."""
-    await async_unload_entry(hass, entry)
-    await async_setup_entry(hass, entry)
+    await hass.config_entries.async_reload(entry.entry_id)
