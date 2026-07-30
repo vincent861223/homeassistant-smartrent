@@ -83,7 +83,46 @@ unavailable for this integration either way. The rename is hygiene: it keeps the
 name free for a real diagnostics platform, and avoids this module being imported
 during platform discovery for unrelated reasons.
 
-### 6. Reload hygiene
+### 6. Confirm timeout shortened; hub-level status logged on failure
+
+A user reported SmartRent going intermittently unresponsive after a few
+lock toggles, including through the *official SmartRent app* -- not just
+this integration. That detail matters: the app is a separate, independently
+-coded client hitting the same cloud API, so if it fails at the same time
+this integration does, the cause is very unlikely to be something in this
+codebase's own connection handling.
+
+Two theories were tested live against the real account before writing any
+fix:
+
+1. **Does a command's short-lived connection evict the persistent updater
+   websocket's channel subscription** (both join the same `devices:{id}`
+   topic)? Four rapid real toggles against an isolated listener did not
+   disrupt it at all -- refuted.
+2. **Does the persistent connection go silently stale from elapsed
+   connection age**, given it never sends anything after its initial join
+   (a real gap versus Phoenix's own JS client, which heartbeats every 30s)?
+   A 5.5-minute sustained probe, well past the ~3.5min mark where this was
+   observed in production, did not reproduce it either.
+
+Neither reproduced a stuck state. Combined with the official app also
+failing, this points to an intermittent condition in SmartRent's own
+infrastructure that a client-side patch cannot fix or prevent.
+
+Given that, `CONFIRM_TIMEOUT` (`lock.py`) was cut from 15s to 6s -- every
+successful echo observed, in testing and production, arrived within
+0-4.5s, and the REST fallback itself resolves in ~100-200ms once
+triggered, so 15s of silence before falling back was pure unnecessary
+delay. And `patches.py` gained `async_log_hub_status()`: `GET /hubs`
+reports the physical hub's own online/connection status, distinct from
+each device's own online flag, and nothing in this codebase checked it
+before. It's now logged at WARNING on every confirm timeout -- if this
+recurs, the diagnostic log will show whether the hub itself was reported
+unreachable from SmartRent's cloud (explaining the app failing too) or
+not, which is the one signal that was missing to tell these failure modes
+apart.
+
+### 7. Reload hygiene
 
 `entry.add_update_listener` is registered via `async_on_unload` so repeated
 reloads stop stacking listeners; unload uses `async_unload_platforms`; and
