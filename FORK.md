@@ -1,0 +1,109 @@
+# Fork notes
+
+This is a maintenance fork of
+[ZacheryThomas/homeassistant-smartrent](https://github.com/ZacheryThomas/homeassistant-smartrent),
+branched from **v0.5.5**. It exists to fix an intermittent failure where SmartRent
+stops accepting commands and the integration reports success anyway.
+
+`main` here tracks upstream plus the commits below. To pull upstream changes in:
+
+```sh
+git fetch upstream
+git merge upstream/main      # or: git rebase upstream/main
+```
+
+## What diverges from upstream
+
+### 1. Commands are verified instead of fired and forgotten
+
+Upstream `smartrent-py` `Client._async_send_payload` opens a websocket, sends
+`phx_join` and `update_attributes` back to back, then closes the socket
+immediately — without ever reading a Phoenix reply. A command the hub never
+processed is indistinguishable from one that worked.
+
+`custom_components/smartrent/patches.py` replaces it with a version that awaits
+the `phx_join` reply and requires `status == "ok"` before sending. Phoenix always
+acknowledges `phx_join`, so a missing ack is a hard failure. `update_attributes`
+is *not* guaranteed to generate a reply, so a missing one is treated as
+provisional success and only an explicit rejection fails.
+
+### 2. The access token no longer races expiry
+
+The token lives **900s**, but upstream only refreshes it reactively off a **600s**
+REST poll. That leaves a 300s window every cycle where the token is dead and
+nothing knows it — 25% of wall-clock time. Commands issued in that window fail
+their websocket handshake.
+
+`patches.py` refreshes proactively (120s skew) and force-refreshes between
+retries, bypassing the `_token_exp_time` guard that logs
+`"Token not expired. Not refreshing."` and otherwise makes the retry replay the
+same rejected token.
+
+### 3. Entities report availability
+
+`sensor.py` already gated `available` on `device.get_online()`, but `lock.py` and
+`climate.py` had no `available` property, so during a hub outage they kept showing
+stale state while the sensors correctly went unavailable. Both now derive
+availability from `get_online()`.
+
+### 4. Lock changes are confirmed
+
+`lock.py` waits up to 15s for the hub to echo the new state over the updater
+websocket (~5s typical), falls back to an explicit REST read if no echo arrives
+(the updater socket may be mid-reconnect), and raises `HomeAssistantError` only
+when neither source agrees. It also reports `is_locking` / `is_unlocking` during
+the wait.
+
+`DoorLock.async_set_locked` no longer sets `_locked` optimistically before
+sending.
+
+### 5. Optional tracing
+
+`custom_components/smartrent/tracing.py` adds read-only instrumentation —
+per-command latencies and token lifetime, token rotations, online/offline
+transitions, and updater-websocket reconnect churn — mirrored to a rotating
+`smartrent_diagnostic.log` in the config directory. Enable with:
+
+```yaml
+logger:
+  logs:
+    smartrent: debug
+    custom_components.smartrent: debug
+```
+
+Named `tracing.py` rather than `diagnostics.py` on purpose: Home Assistant
+discovers `<integration>/diagnostics.py` as the "Download diagnostics" platform,
+so that filename would shadow it and silently disable the feature.
+
+### 6. Reload hygiene
+
+`entry.add_update_listener` is registered via `async_on_unload` so repeated
+reloads stop stacking listeners; unload uses `async_unload_platforms`; and
+`async_reload_entry` delegates to `hass.config_entries.async_reload`. This
+matters because reloading the config entry (~1s) is the recommended recovery,
+in place of power-cycling the hub (1–3 minutes).
+
+## Why the library fixes live in the integration
+
+The `_async_send_payload` and `async_set_locked` fixes properly belong in
+[smartrent-py](https://github.com/ZacheryThomas/smartrent-py). They are applied
+here as monkeypatches from `patches.py` instead, so that:
+
+- everything installs through HACS with no Python package to publish, and
+- the fixes survive Home Assistant container image updates that replace
+  `site-packages`.
+
+If they are ever accepted upstream in the library, `patches.py` can be deleted
+and `manifest.json` bumped to the fixed `smartrent-py` release.
+
+## Known upstream issues not fixed here
+
+- `Client._async_update_state_via_ws` initialises `retries = 0` outside its
+  `while True` loop and never resets it on a successful connect, so
+  `wait_time = 1.25 ** retries` grows toward its 300s cap for the life of the
+  process. Fixing it means rewriting the reconnect loop; `tracing.py` makes the
+  degradation observable instead.
+- The same loop builds an SSL context inside the event loop on every reconnect.
+  `patches.py` fixes this for the command path only.
+- `Client._ws` is only ever assigned `None`, so the re-join branch in
+  `_subscribe_device_to_updater` is dead code.
