@@ -27,6 +27,7 @@ from homeassistant.util.ssl import get_default_context
 from smartrent.lock import DoorLock
 from smartrent.utils import (
     COMMAND_PAYLOAD,
+    SMARTRENT_HUBS_URI,
     SMARTRENT_WEBSOCKET_URI,
     Client,
     InvalidAuthError,
@@ -239,6 +240,47 @@ async def _async_send_command(
         f"could not send {attribute_name}={value} to {device._name} "
         f"after {COMMAND_ATTEMPTS} attempts: {last_exc}"
     ) from last_exc
+
+
+async def async_log_hub_status(client: Client, context: str) -> None:
+    """Fetch and log the hub's own ``online``/``connection`` status.
+
+    ``GET /devices/{id}`` (used everywhere else) only reports whether a given
+    *device* considers itself online. ``GET /hubs`` separately reports whether
+    the physical hub itself is reachable from SmartRent's cloud at all -- the
+    signal needed to tell "the hub is down for everyone, including the
+    official SmartRent app" apart from "this integration's own websocket
+    session went stale while the hub is fine". Call this whenever a command
+    fails to confirm, so that distinction is on record if it happens again.
+    """
+    try:
+        resp = await client._aiohttp_session.get(
+            SMARTRENT_HUBS_URI, headers={"authorization": f"Bearer {client._token}"}
+        )
+        hubs = await resp.json()
+    except Exception as exc:  # noqa: BLE001 - this is diagnostic, must never raise
+        _LOGGER.warning(
+            "TRACE hub status (%s) check failed: %s: %s",
+            context,
+            type(exc).__name__,
+            exc,
+        )
+        return
+
+    if not isinstance(hubs, list):
+        _LOGGER.warning("TRACE hub status (%s) unexpected response: %s", context, hubs)
+        return
+
+    for hub in hubs:
+        _LOGGER.warning(
+            "TRACE hub status (%s): id=%s online=%s connection=%s (%s) firmware=%s",
+            context,
+            hub.get("id"),
+            hub.get("online"),
+            hub.get("connection"),
+            hub.get("connection_info"),
+            hub.get("firmware"),
+        )
 
 
 async def _async_set_locked(self: DoorLock, value: bool) -> None:

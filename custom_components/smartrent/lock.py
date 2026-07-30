@@ -10,11 +10,16 @@ from smartrent import DoorLock
 from smartrent.utils import SmartRentError
 
 from .const import CONFIGURATION_URL, PROPER_NAME
+from .patches import async_log_hub_status
 
 _LOGGER = logging.getLogger(__name__)
 
-# The hub echoes the new state back over the updater websocket in ~5s.
-CONFIRM_TIMEOUT = 15.0
+# Every websocket echo observed in testing and production arrived within
+# 0-4.5s; REST fallback itself resolves in ~100-200ms once triggered. 15s was
+# needlessly conservative and is exactly what made a hub-side hiccup feel like
+# "the lock doesn't respond" -- the command was retried and eventually
+# confirmed correctly, just after a much longer wait than necessary.
+CONFIRM_TIMEOUT = 6.0
 CONFIRM_POLL_INTERVAL = 0.5
 
 
@@ -128,12 +133,18 @@ class SmartrentLock(LockEntity):
             await asyncio.sleep(CONFIRM_POLL_INTERVAL)
 
         # The updater websocket may be mid-reconnect, so ask the REST endpoint
-        # rather than reporting a failure we are not sure about.
+        # rather than reporting a failure we are not sure about. Also check
+        # whether the hub itself is reachable from SmartRent's cloud at all --
+        # if it's not, that would affect the official app too, and is not
+        # something this integration caused or can fix by itself.
         _LOGGER.warning(
             "TRACE confirm no websocket echo for locked=%s after %.0fs "
             "(updater socket may be down) -- falling back to REST",
             locked,
             CONFIRM_TIMEOUT,
+        )
+        await async_log_hub_status(
+            self.device._client, context=f"confirm-timeout locked={locked}"
         )
         try:
             await self.device._async_fetch_state()
