@@ -104,6 +104,63 @@ here as monkeypatches from `patches.py` instead, so that:
 If they are ever accepted upstream in the library, `patches.py` can be deleted
 and `manifest.json` bumped to the fixed `smartrent-py` release.
 
+## How this gets installed
+
+Installed via HACS as a custom repository (`vincent861223/homeassistant-smartrent`,
+category `integration`), *not* through HACS's default store — the fork isn't and
+won't be submitted there, since it would then compete with upstream's own listing
+for the same `smartrent` domain.
+
+`hacs.json` sets `zip_release: true` with `filename: smartrent.zip`, so HACS
+installs from a `smartrent.zip` release asset, not directly from the repository
+tree. There is currently no working CI to build that asset automatically —
+`.github/workflows/release.yml` would do it, but GitHub disables `on: push`
+Actions runs on a fork until the owner clicks through the banner on the fork's
+Actions tab, and even then the `gh` OAuth token used for this fork lacks the
+`workflow` scope needed to push tags on commits touching `.github/workflows/*`.
+So releases are built and published by hand:
+
+```sh
+# 1. Bump custom_components/smartrent/manifest.json "version" (informational only —
+#    HACS compares against the release tag below, not this field).
+# 2. Commit, then tag and push:
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin main vX.Y.Z          # NOT `--tags`: that also tries to push every
+                                      # old upstream tag and fails on the ones that
+                                      # touch .github/workflows/* without the
+                                      # `workflow` OAuth scope
+
+# 3. Build the zip in a clean ubuntu-latest container, matching what
+#    release.yml would have produced:
+docker run --rm -v "$PWD:/repo" -w /repo/custom_components/smartrent ubuntu:latest \
+  bash -c 'apt-get -qq update && apt-get -qq install -y zip && rm -rf __pycache__ && zip -q smartrent.zip -r ./'
+
+# 4. Publish the release with that zip attached as an asset named smartrent.zip:
+gh release create vX.Y.Z custom_components/smartrent/smartrent.zip \
+  --repo vincent861223/homeassistant-smartrent --title "vX.Y.Z" --notes "..."
+```
+
+Then in Home Assistant: HACS → the SmartRent card shows an update → Update →
+restart Home Assistant to activate (integrations need a restart; HACS says so in
+its own note after install).
+
+To install from scratch on a new Home Assistant instance: HACS → Integrations →
+⋮ → Custom repositories → add `vincent861223/homeassistant-smartrent` as an
+Integration → search "SmartRent" → Download → restart → add the integration via
+Settings → Devices & Services as usual.
+
+Every commit is checked against the repo's actual `.pre-commit-config.yaml`
+before pushing (black, isort, flake8, mypy). The pinned hook versions
+(black 23.1.0, flake8 6.0.0) fail outright on Python 3.12+ (`ast.Str` was
+removed), which is also why the workflow above runs in a `python:3.11-slim`
+container rather than on the host:
+
+```sh
+docker run --rm -v "$PWD:/src" -w /src python:3.11-slim sh -c '
+  pip install -q pre-commit && git config --global --add safe.directory /src
+  pre-commit run --all-files'
+```
+
 ## Known upstream issues not fixed here
 
 - `Client._async_update_state_via_ws` initialises `retries = 0` outside its
