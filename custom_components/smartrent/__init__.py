@@ -4,7 +4,6 @@ Custom integration to integrate integration_blueprint with Home Assistant.
 For more details about this integration, please refer to
 https://github.com/custom-components/integration_blueprint
 """
-
 import logging
 
 from aiohttp.client_exceptions import ClientConnectorError
@@ -25,6 +24,7 @@ from .const import (
     STARTUP_MESSAGE,
 )
 from .patches import apply_patches
+from .tracing import instrument, setup_file_log
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
@@ -34,6 +34,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     # Fixes for smartrent-py 0.5.2 live in patches.py rather than in
     # site-packages so they survive container image updates.
     apply_patches()
+
+    # Read-only tracing, so an intermittent failure leaves evidence behind.
+    await hass.async_add_executor_job(setup_file_log, hass.config.config_dir)
+    instrument()
 
     if hass.data.get(DOMAIN) is None:
         hass.data.setdefault(DOMAIN, {})
