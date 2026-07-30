@@ -72,8 +72,16 @@ logger:
 ```
 
 Named `tracing.py` rather than `diagnostics.py` on purpose: Home Assistant
-discovers `<integration>/diagnostics.py` as the "Download diagnostics" platform,
-so that filename would shadow it and silently disable the feature.
+discovers `<integration>/diagnostics.py` for every integration via
+`async_process_integration_platforms` and registers
+`getattr(platform, "async_get_config_entry_diagnostics", None)` from it, so that
+filename shadows the "Download diagnostics" platform.
+
+In practice the impact today is nil — upstream does not implement
+`async_get_config_entry_diagnostics`, so Download Diagnostics is already
+unavailable for this integration either way. The rename is hygiene: it keeps the
+name free for a real diagnostics platform, and avoids this module being imported
+during platform discovery for unrelated reasons.
 
 ### 6. Reload hygiene
 
