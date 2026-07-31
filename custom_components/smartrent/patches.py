@@ -25,6 +25,7 @@ from typing import Any, Optional
 import websockets
 from homeassistant.util.ssl import get_default_context
 from smartrent.lock import DoorLock
+from smartrent.thermostat import Thermostat
 from smartrent.utils import (
     COMMAND_PAYLOAD,
     SMARTRENT_HUBS_URI,
@@ -295,6 +296,48 @@ async def _async_set_locked(self: DoorLock, value: bool) -> None:
     )
 
 
+_THERMOSTAT_MODES = ["aux_heat", "heat", "cool", "auto", "off"]
+_THERMOSTAT_FAN_MODES = ["on", "auto"]
+
+
+async def _async_set_heating_setpoint(self: Thermostat, value) -> None:
+    """Send the command without optimistically caching the requested value.
+
+    Replaces ``Thermostat.async_set_heating_setpoint``, which set
+    ``self._heating_setpoint`` unconditionally after calling
+    ``_async_send_command`` -- even if the hub only acknowledged delivery to
+    SmartRent's cloud and never actually applied it. That let the entity
+    display a setpoint that was never real. Confirmed state now only comes
+    from the websocket echo or a REST fetch (see climate.py).
+    """
+    await self._client._async_send_command(
+        self, attribute_name="heating_setpoint", value=str(value)
+    )
+
+
+async def _async_set_cooling_setpoint(self: Thermostat, value) -> None:
+    """See ``_async_set_heating_setpoint`` -- same fix, cooling setpoint."""
+    await self._client._async_send_command(
+        self, attribute_name="cooling_setpoint", value=str(value)
+    )
+
+
+async def _async_set_thermostat_mode(self: Thermostat, mode: str) -> None:
+    """See ``_async_set_heating_setpoint`` -- same fix, hvac mode."""
+    if mode not in _THERMOSTAT_MODES:
+        raise ValueError(f"{mode} not in {_THERMOSTAT_MODES}")
+    await self._client._async_send_command(self, attribute_name="mode", value=mode)
+
+
+async def _async_set_thermostat_fan_mode(self: Thermostat, fan_mode: str) -> None:
+    """See ``_async_set_heating_setpoint`` -- same fix, fan mode."""
+    if fan_mode not in _THERMOSTAT_FAN_MODES:
+        raise ValueError(f"{fan_mode} not in {_THERMOSTAT_FAN_MODES}")
+    await self._client._async_send_command(
+        self, attribute_name="fan_mode", value=fan_mode
+    )
+
+
 def apply_patches() -> None:
     """Patch the installed smartrent client. Safe to call more than once."""
     global _PATCHED
@@ -304,6 +347,10 @@ def apply_patches() -> None:
     Client._async_send_payload = _async_send_payload
     Client._async_send_command = _async_send_command
     DoorLock.async_set_locked = _async_set_locked
+    Thermostat.async_set_heating_setpoint = _async_set_heating_setpoint
+    Thermostat.async_set_cooling_setpoint = _async_set_cooling_setpoint
+    Thermostat.async_set_mode = _async_set_thermostat_mode
+    Thermostat.async_set_fan_mode = _async_set_thermostat_fan_mode
 
     _PATCHED = True
     _LOGGER.info("Applied smartrent-py command-acknowledgement patches")

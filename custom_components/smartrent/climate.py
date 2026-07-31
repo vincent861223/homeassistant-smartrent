@@ -1,6 +1,7 @@
 """Platform for climate integration."""
+import asyncio
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import (
@@ -17,8 +18,19 @@ from smartrent import Thermostat
 from smartrent.utils import SmartRentError
 
 from .const import CONFIGURATION_URL, DOMAIN, PROPER_NAME
+from .patches import async_log_hub_status
 
 _LOGGER = logging.getLogger(__name__)
+
+# HomeKit and voice assistants can send several rapid setpoint updates in a
+# row (e.g. dragging a slider), so confirmation here is non-blocking -- it
+# never delays the service call the way the lock's does. It only verifies,
+# in the background, that SmartRent's cloud accepting the command actually
+# meant the physical hub applied it, which is not the same thing: a command
+# can get a clean "ok" from the cloud and never reach the hardware if the hub
+# itself is unresponsive.
+CONFIRM_TIMEOUT = 6.0
+CONFIRM_POLL_INTERVAL = 0.5
 
 HA_HVAC_MODE_TO_SMARTRENT = {
     HVACMode.COOL: "cool",
@@ -165,20 +177,98 @@ class SmartrentThermostat(ClimateEntity):
         """Return the list of available operation modes."""
         return SUPPORT_HVAC
 
-    async def _async_send(self, what: str, coro) -> None:
-        """Await a device setter, surfacing delivery failures to the caller."""
+    async def _async_send(
+        self,
+        what: str,
+        coro,
+        confirm: Optional[
+            tuple[Callable[[], object], object, Callable[[object], str]]
+        ] = None,
+    ) -> None:
+        """Await a device setter, surfacing delivery failures to the caller.
+
+        ``confirm``, if given, is ``(getter, target, describe)``: a
+        background task polls ``getter()`` against ``target`` and logs
+        loudly -- with hub status -- if the hub never actually applied the
+        change, without blocking this call.
+        """
         try:
             await coro
         except SmartRentError as err:
             raise HomeAssistantError(f"{self.name}: {what} failed: {err}") from err
+
+        if confirm is not None:
+            getter, target, describe = confirm
+            self.hass.async_create_task(
+                self._async_confirm_background(what, getter, target, describe),
+                name=f"smartrent confirm {what}",
+            )
+
+    async def _async_confirm_background(
+        self,
+        what: str,
+        getter: Callable[[], object],
+        target: object,
+        describe: Callable[[object], str],
+    ) -> None:
+        """Best-effort, non-blocking check that a command actually landed.
+
+        SmartRent's cloud can acknowledge a command the physical hub never
+        applies -- the delivery check in patches.py only confirms the cloud
+        accepted it, not that the hardware moved. This is what catches that.
+        """
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + CONFIRM_TIMEOUT
+        while loop.time() < deadline:
+            if getter() == target:
+                _LOGGER.debug(
+                    "TRACE confirm OK %s via websocket echo in %.1fs",
+                    what,
+                    loop.time() - started,
+                )
+                return
+            await asyncio.sleep(CONFIRM_POLL_INTERVAL)
+
+        _LOGGER.warning(
+            "TRACE confirm no websocket echo for %s after %.0fs "
+            "(updater socket may be down) -- falling back to REST",
+            what,
+            CONFIRM_TIMEOUT,
+        )
+        await async_log_hub_status(
+            self.device._client, context=f"confirm-timeout {what}"
+        )
+        try:
+            await self.device._async_fetch_state()
+        except (SmartRentError, OSError) as err:
+            _LOGGER.error("TRACE confirm %s REST read failed: %s", what, err)
+            self.async_write_ha_state()
+            return
+
+        actual = getter()
+        if actual == target:
+            _LOGGER.debug("TRACE confirm OK %s via REST", what)
+        else:
+            _LOGGER.error(
+                "TRACE confirm FAILED %s -- hub never applied it (%s)",
+                what,
+                describe(actual),
+            )
+        self.async_write_ha_state()
 
     async def async_set_hvac_mode(self, hvac_mode):
         """Set new target operation mode."""
         smartrent_hvac_mode = HA_HVAC_MODE_TO_SMARTRENT.get(hvac_mode)
 
         await self._async_send(
-            f"set hvac_mode={hvac_mode}",
+            f"hvac_mode={hvac_mode}",
             self.device.async_set_mode(smartrent_hvac_mode),
+            confirm=(
+                self.device.get_mode,
+                smartrent_hvac_mode,
+                lambda actual: f"requested mode={smartrent_hvac_mode} actual={actual}",
+            ),
         )
 
     @property
@@ -186,32 +276,60 @@ class SmartrentThermostat(ClimateEntity):
         """Return the current running hvac operation ie. cooling, heating, off"""
         return SMARTRENT_HVAC_ACTION_TO_HA.get(self.device.get_operating_state())
 
+    @staticmethod
+    def _setpoint_confirm(attribute: str, requested, getter: Callable[[], object]):
+        """Build a ``confirm`` tuple for a setpoint. The hub stores setpoints
+        as truncated ints (``int(float(x))``), so the target must match that
+        exactly or a legitimate confirmation would never compare equal."""
+        target = int(float(requested))
+        return (
+            getter,
+            target,
+            lambda actual: f"requested {attribute}={target} actual={actual}",
+        )
+
     async def async_set_temperature(self, **kwargs):
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature:
             if self.device.get_mode() == "cool":
                 await self._async_send(
-                    f"set cooling_setpoint={temperature}",
+                    f"cooling_setpoint={temperature}",
                     self.device.async_set_cooling_setpoint(temperature),
+                    confirm=self._setpoint_confirm(
+                        "cooling_setpoint",
+                        temperature,
+                        self.device.get_cooling_setpoint,
+                    ),
                 )
             else:
                 await self._async_send(
-                    f"set heating_setpoint={temperature}",
+                    f"heating_setpoint={temperature}",
                     self.device.async_set_heating_setpoint(temperature),
+                    confirm=self._setpoint_confirm(
+                        "heating_setpoint",
+                        temperature,
+                        self.device.get_heating_setpoint,
+                    ),
                 )
 
         tt_high = kwargs.get("target_temp_high")
         if tt_high:
             await self._async_send(
-                f"set cooling_setpoint={tt_high}",
+                f"cooling_setpoint={tt_high}",
                 self.device.async_set_cooling_setpoint(tt_high),
+                confirm=self._setpoint_confirm(
+                    "cooling_setpoint", tt_high, self.device.get_cooling_setpoint
+                ),
             )
 
         tt_low = kwargs.get("target_temp_low")
         if tt_low:
             await self._async_send(
-                f"set heating_setpoint={tt_low}",
+                f"heating_setpoint={tt_low}",
                 self.device.async_set_heating_setpoint(tt_low),
+                confirm=self._setpoint_confirm(
+                    "heating_setpoint", tt_low, self.device.get_heating_setpoint
+                ),
             )
 
     @property
@@ -226,8 +344,14 @@ class SmartrentThermostat(ClimateEntity):
         smartrent_fan_mode = HA_FAN_TO_SMART_RENT.get(fan_mode)
 
         await self._async_send(
-            f"set fan_mode={fan_mode}",
+            f"fan_mode={fan_mode}",
             self.device.async_set_fan_mode(smartrent_fan_mode),
+            confirm=(
+                self.device.get_fan_mode,
+                smartrent_fan_mode,
+                lambda actual: f"requested fan_mode={smartrent_fan_mode} "
+                f"actual={actual}",
+            ),
         )
 
     @property
