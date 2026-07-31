@@ -48,11 +48,11 @@ availability from `get_online()`.
 
 ### 4. Lock changes are confirmed
 
-`lock.py` waits up to 15s for the hub to echo the new state over the updater
-websocket (~5s typical), falls back to an explicit REST read if no echo arrives
-(the updater socket may be mid-reconnect), and raises `HomeAssistantError` only
-when neither source agrees. It also reports `is_locking` / `is_unlocking` during
-the wait.
+`lock.py` waits up to 6s (see #6) for the hub to echo the new state over the
+updater websocket (0-4.5s typical), falls back to an explicit REST read if no
+echo arrives (the updater socket may be mid-reconnect), and raises
+`HomeAssistantError` only when neither source agrees. It also reports
+`is_locking` / `is_unlocking` during the wait.
 
 `DoorLock.async_set_locked` no longer sets `_locked` optimistically before
 sending.
@@ -122,7 +122,56 @@ unreachable from SmartRent's cloud (explaining the app failing too) or
 not, which is the one signal that was missing to tell these failure modes
 apart.
 
-### 7. Reload hygiene
+### 7. Climate setpoints could lie, and never confirmed either
+
+A live report gave the theory in #6 a concrete confirmation. A HomeKit
+thermostat adjustment appeared to do nothing, and the *official SmartRent
+app* also could not control anything during the same window -- the log
+showed exactly why:
+
+```
+23:49:52  command START cooling_setpoint=71.6
+23:49:52  command DELIVERED (cloud accepted, 441ms)
+23:49:53  command START cooling_setpoint=70.7
+23:49:53  command DELIVERED (cloud accepted, 514ms)
+              ... 98 seconds of nothing ...
+23:51:31  echo arrives: cooling_setpoint -> 71
+```
+
+Both commands were acknowledged by SmartRent's cloud in under 600ms each, but
+the value that actually landed on the hardware, 98 seconds later, was 71 --
+neither of the two values requested. The hub was unreachable long enough that
+even the official app couldn't reach it; this integration's commands weren't
+lost, they were accepted by the cloud and then never applied by the
+(temporarily unresponsive) physical hub.
+
+Two bugs in this codebase made that invisible instead of merely slow:
+
+1. `Thermostat.async_set_{cooling,heating}_setpoint` / `async_set_mode` /
+   `async_set_fan_mode` (unpatched until now) all wrote the requested value to
+   `self._X` immediately after calling `_async_send_command`, regardless of
+   whether the hub actually applied it -- the exact class of bug already fixed
+   for `DoorLock.async_set_locked` in #1, never ported to `Thermostat`. The
+   entity's displayed setpoint was a lie for the full 98s. Fixed the same way:
+   the setters now only send the command, never cache the requested value.
+2. `climate.py` only checked that the cloud *accepted* delivery -- there was
+   no equivalent of the lock's confirmation checking whether the hub actually
+   applied the change. A silently-dropped command looked identical, in every
+   log, to a fully successful one.
+
+Unlike the lock, confirmation here is **non-blocking**: thermostats routinely
+get rapid successive commands (HomeKit slider drags, voice assistants),
+unlike a lock's single discrete toggle, so blocking every command for up to
+6s the way the lock does would make each one feel laggy. The service call
+returns immediately; a background task polls for the hub's echo (or falls
+back to REST, same as the lock) and, only if a command was genuinely never
+applied, logs it at ERROR with a hub-status check -- without holding up the
+caller. Verified against a reconstruction of the exact scenario above: two
+rapid commands, only a third unrelated value lands -- each is independently
+and correctly judged against its own target, not against whichever one
+happened to resolve last.
+
+### 8. Reload hygiene
 
 `entry.add_update_listener` is registered via `async_on_unload` so repeated
 reloads stop stacking listeners; unload uses `async_unload_platforms`; and
