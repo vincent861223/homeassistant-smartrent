@@ -10,7 +10,7 @@ from smartrent import DoorLock
 from smartrent.utils import SmartRentError
 
 from .const import CONFIGURATION_URL, PROPER_NAME
-from .patches import async_log_hub_status
+from .patches import async_log_no_echo, async_watch_late_echo
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -141,26 +141,38 @@ class SmartrentLock(LockEntity):
         requested value once it accepts a command, even if the lock never
         moved. Resending is safe because the command is idempotent.
         """
+        loop = asyncio.get_running_loop()
+        sent_at = loop.time()
         if await self._async_wait_for_echo(locked, CONFIRM_TIMEOUT):
             return True
 
-        # Also record whether the hub itself is reachable from SmartRent's
-        # cloud -- if it's not, that would affect the official app too, and is
-        # not something this integration caused or can fix by itself.
         _LOGGER.warning(
             "TRACE confirm no websocket echo for locked=%s after %.0fs -- resending",
             locked,
             CONFIRM_TIMEOUT,
         )
-        await async_log_hub_status(
-            self.device._client, context=f"confirm-timeout locked={locked}"
-        )
+        await async_log_no_echo(self.device, f"confirm-timeout locked={locked}")
         await self.device.async_set_locked(locked)
         if await self._async_wait_for_echo(locked, RESEND_CONFIRM_TIMEOUT):
+            _LOGGER.warning(
+                "TRACE resend OK locked=%s, %.1fs after the first send",
+                locked,
+                loop.time() - sent_at,
+            )
             return True
 
         _LOGGER.error(
             "TRACE confirm FAILED locked=%s -- no echo after resending", locked
+        )
+        self.hass.async_create_background_task(
+            async_watch_late_echo(
+                self.device,
+                f"locked={locked}",
+                self.device.get_locked,
+                locked,
+                sent_at,
+            ),
+            name=f"smartrent late echo locked={locked}",
         )
         return False
 

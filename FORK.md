@@ -215,8 +215,19 @@ change made at the thermostat. A periodic REST poll landing inside the wait can
 still satisfy the check; that window is ~16s in every 600s.
 
 Whether a resend helps depends on SmartRent forwarding a value its cloud already
-holds, which has not been observed either way. Look for `no websocket echo`
-followed by `confirm OK` or `confirm FAILED` to find out.
+holds, which has not been observed either way. `TRACE resend OK` or
+`TRACE confirm FAILED` after `no websocket echo` answers that.
+
+A missing echo now records what it takes to tell the causes apart, all from
+`tracing.py` and `patches.py` and all read-only:
+
+- `TRACE updater socket`: connection age and the last event's age, so a dead
+  socket can be told from a silent hub without reading around the failure.
+- `TRACE cloud state`: the cloud's raw device data, fetched without touching
+  entity state.
+- `TRACE late echo` / `TRACE no echo for`: after giving up, a 120s background
+  watch records whether the value landed late, then reads the cloud again to
+  catch a value that reverted.
 
 ## Why the library fixes live in the integration
 

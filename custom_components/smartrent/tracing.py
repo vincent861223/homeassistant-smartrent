@@ -34,6 +34,7 @@ _instrumented = False
 # Populated by the instrumentation below.
 _ws_connects = 0
 _last_ws_connect: float | None = None
+_last_ws_event: float | None = None
 
 
 def _ttl(client: Client) -> str:
@@ -42,6 +43,21 @@ def _ttl(client: Client) -> str:
     if not exp:
         return "ttl=unknown"
     return f"ttl={exp - time.time():+.0f}s"
+
+
+def ws_status() -> str:
+    """Describe the updater socket, to tell a dead socket from a silent hub.
+
+    Temperature and humidity reports arrive every few minutes, so a last event
+    far older than that means the socket stopped delivering.
+    """
+    if _last_ws_connect is None:
+        return "never connected"
+    now = time.monotonic()
+    connected = f"connected {now - _last_ws_connect:.0f}s ago"
+    if _last_ws_event is None:
+        return f"{connected}, no events yet"
+    return f"{connected}, last event {now - _last_ws_event:.0f}s ago"
 
 
 def setup_file_log(config_dir: str) -> None:
@@ -168,6 +184,19 @@ def _wrap_ws_join_devices():
     Client._async_ws_join_devices = wrapper
 
 
+def _wrap_device_update():
+    """Remember when the updater socket last delivered an event."""
+    original = Device._update
+
+    @functools.wraps(original)
+    async def wrapper(self: Device, event):
+        global _last_ws_event
+        _last_ws_event = time.monotonic()
+        return await original(self, event)
+
+    Device._update = wrapper
+
+
 def instrument() -> None:
     """Attach the observational wrappers. Safe to call more than once."""
     global _instrumented
@@ -177,6 +206,7 @@ def instrument() -> None:
     _wrap_fetch_state()
     _wrap_refresh_token()
     _wrap_ws_join_devices()
+    _wrap_device_update()
 
     _instrumented = True
     _LOGGER.info("SmartRent diagnostic instrumentation attached")

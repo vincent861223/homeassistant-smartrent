@@ -19,7 +19,7 @@ from smartrent import Thermostat
 from smartrent.utils import SmartRentError
 
 from .const import CONFIGURATION_URL, DOMAIN, PROPER_NAME
-from .patches import async_log_hub_status
+from .patches import async_log_no_echo, async_watch_late_echo
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -247,6 +247,8 @@ class SmartrentThermostat(ClimateEntity):
         accepted it, not that the hardware moved. REST cannot settle it either,
         since the cloud reports the requested value until the hub overrides it.
         """
+        loop = asyncio.get_running_loop()
+        sent_at = loop.time()
         if await self._async_wait_for_echo(what, getter, target, CONFIRM_TIMEOUT):
             return
 
@@ -255,9 +257,7 @@ class SmartrentThermostat(ClimateEntity):
             what,
             CONFIRM_TIMEOUT,
         )
-        await async_log_hub_status(
-            self.device._client, context=f"confirm-timeout {what}"
-        )
+        await async_log_no_echo(self.device, f"confirm-timeout {what}")
 
         # A resend must never undo something newer: a later command for this
         # attribute (HomeKit slider drags), or a change made at the thermostat.
@@ -272,14 +272,25 @@ class SmartrentThermostat(ClimateEntity):
             _LOGGER.error("TRACE confirm FAILED %s -- resend failed: %s", what, err)
             return
 
-        if not await self._async_wait_for_echo(
+        if await self._async_wait_for_echo(
             what, getter, target, RESEND_CONFIRM_TIMEOUT
         ):
-            _LOGGER.error(
-                "TRACE confirm FAILED %s -- hub never applied it (%s)",
+            _LOGGER.warning(
+                "TRACE resend OK %s, %.1fs after the first send",
                 what,
-                describe(getter()),
+                loop.time() - sent_at,
             )
+            return
+
+        _LOGGER.error(
+            "TRACE confirm FAILED %s -- hub never applied it (%s)",
+            what,
+            describe(getter()),
+        )
+        self.hass.async_create_background_task(
+            async_watch_late_echo(self.device, what, getter, target, sent_at),
+            name=f"smartrent late echo {what}",
+        )
 
     async def async_set_hvac_mode(self, hvac_mode):
         """Set new target operation mode."""

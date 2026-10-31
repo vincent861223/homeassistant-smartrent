@@ -20,7 +20,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import websockets
 from homeassistant.util.ssl import get_default_context
@@ -36,6 +36,8 @@ from smartrent.utils import (
 )
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+from .tracing import ws_status
+
 _LOGGER = logging.getLogger(__name__)
 
 # Phoenix always replies to phx_join, so a missing join ack is a hard failure.
@@ -47,6 +49,9 @@ COMMAND_ATTEMPTS = 2
 RETRY_DELAY_SECONDS = 0.5
 # Refresh this far ahead of nominal expiry rather than waiting for a 403.
 TOKEN_SKEW_SECONDS = 120
+# After giving up on a command, keep watching this long for a late echo.
+LATE_ECHO_WINDOW = 120.0
+LATE_ECHO_POLL = 1.0
 
 # Resolved at import time -- Home Assistant imports integrations in an executor
 # thread, so this stays off the event loop. Without it websockets falls back to
@@ -294,6 +299,67 @@ async def _async_set_locked(self: DoorLock, value: bool) -> None:
     await self._client._async_send_command(
         self, attribute_name="locked", value=str(value).lower()
     )
+
+
+async def async_log_cloud_state(device, context: str) -> None:
+    """Log what SmartRent's cloud holds for ``device``, leaving its state alone.
+
+    The cloud can hold a requested value the hardware never applied, so this
+    is evidence to compare against the echoes, never a confirmation.
+    """
+    try:
+        data = await device._client.async_get_device_data(device._device_id)
+    except Exception as exc:  # noqa: BLE001 - this is diagnostic, must never raise
+        _LOGGER.warning(
+            "TRACE cloud state (%s) check failed: %s: %s",
+            context,
+            type(exc).__name__,
+            exc,
+        )
+        return
+
+    _LOGGER.warning(
+        "TRACE cloud state (%s): online=%s battery=%s attributes=%s",
+        context,
+        data.get("online"),
+        data.get("battery_level"),
+        data.get("attributes"),
+    )
+
+
+async def async_log_no_echo(device, context: str) -> None:
+    """Record everything that tells apart why a command got no echo."""
+    _LOGGER.warning("TRACE updater socket (%s): %s", context, ws_status())
+    await async_log_hub_status(device._client, context)
+    await async_log_cloud_state(device, context)
+
+
+async def async_watch_late_echo(
+    device, what: str, getter: Callable[[], object], target: object, sent_at: float
+) -> None:
+    """After giving up, record if the value landed late and what the cloud holds.
+
+    Tells a slow hub from a dropped command, and shows a cloud value that
+    reverted, which a single read right after the command cannot.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + LATE_ECHO_WINDOW
+    while loop.time() < deadline:
+        if getter() == target:
+            _LOGGER.warning(
+                "TRACE late echo %s %.0fs after the first send",
+                what,
+                loop.time() - sent_at,
+            )
+            break
+        await asyncio.sleep(LATE_ECHO_POLL)
+    else:
+        _LOGGER.warning(
+            "TRACE no echo for %s within %.0fs of the first send",
+            what,
+            loop.time() - sent_at,
+        )
+    await async_log_cloud_state(device, f"after {what}")
 
 
 _THERMOSTAT_MODES = ["aux_heat", "heat", "cool", "auto", "off"]
