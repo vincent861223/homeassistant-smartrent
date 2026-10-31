@@ -5,6 +5,7 @@ from typing import Callable, Optional
 
 from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import (
+    ATTR_HVAC_MODE,
     FAN_AUTO,
     FAN_ON,
     ClimateEntityFeature,
@@ -278,59 +279,64 @@ class SmartrentThermostat(ClimateEntity):
 
     @staticmethod
     def _setpoint_confirm(attribute: str, requested, getter: Callable[[], object]):
-        """Build a ``confirm`` tuple for a setpoint. The hub stores setpoints
-        as truncated ints (``int(float(x))``), so the target must match that
-        exactly or a legitimate confirmation would never compare equal."""
-        target = int(float(requested))
+        """Build a ``confirm`` tuple for a setpoint. The hub stores whole
+        degrees and rounds what it is sent (78.98 comes back as 79), so the
+        target must match that or a legitimate confirmation would never
+        compare equal."""
+        target = round(float(requested))
         return (
             getter,
             target,
             lambda actual: f"requested {attribute}={target} actual={actual}",
         )
 
+    async def _async_set_cooling_setpoint(self, value) -> None:
+        value = round(float(value))
+        await self._async_send(
+            f"cooling_setpoint={value}",
+            self.device.async_set_cooling_setpoint(value),
+            confirm=self._setpoint_confirm(
+                "cooling_setpoint", value, self.device.get_cooling_setpoint
+            ),
+        )
+
+    async def _async_set_heating_setpoint(self, value) -> None:
+        value = round(float(value))
+        await self._async_send(
+            f"heating_setpoint={value}",
+            self.device.async_set_heating_setpoint(value),
+            confirm=self._setpoint_confirm(
+                "heating_setpoint", value, self.device.get_heating_setpoint
+            ),
+        )
+
     async def async_set_temperature(self, **kwargs):
+        mode = self.device.get_mode()
+
+        # climate.set_temperature carries hvac_mode here instead of calling
+        # async_set_hvac_mode. get_mode() stays stale until the hub echoes, so
+        # the setpoint below follows the requested mode, not the reported one.
+        hvac_mode = kwargs.get(ATTR_HVAC_MODE)
+        if hvac_mode:
+            requested_mode = HA_HVAC_MODE_TO_SMARTRENT.get(hvac_mode)
+            if requested_mode != mode:
+                await self.async_set_hvac_mode(hvac_mode)
+            mode = requested_mode
+
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature:
-            if self.device.get_mode() == "cool":
-                await self._async_send(
-                    f"cooling_setpoint={temperature}",
-                    self.device.async_set_cooling_setpoint(temperature),
-                    confirm=self._setpoint_confirm(
-                        "cooling_setpoint",
-                        temperature,
-                        self.device.get_cooling_setpoint,
-                    ),
-                )
+            if mode == "cool":
+                await self._async_set_cooling_setpoint(temperature)
             else:
-                await self._async_send(
-                    f"heating_setpoint={temperature}",
-                    self.device.async_set_heating_setpoint(temperature),
-                    confirm=self._setpoint_confirm(
-                        "heating_setpoint",
-                        temperature,
-                        self.device.get_heating_setpoint,
-                    ),
-                )
+                await self._async_set_heating_setpoint(temperature)
 
         tt_high = kwargs.get("target_temp_high")
         if tt_high:
-            await self._async_send(
-                f"cooling_setpoint={tt_high}",
-                self.device.async_set_cooling_setpoint(tt_high),
-                confirm=self._setpoint_confirm(
-                    "cooling_setpoint", tt_high, self.device.get_cooling_setpoint
-                ),
-            )
+            await self._async_set_cooling_setpoint(tt_high)
 
         tt_low = kwargs.get("target_temp_low")
         if tt_low:
-            await self._async_send(
-                f"heating_setpoint={tt_low}",
-                self.device.async_set_heating_setpoint(tt_low),
-                confirm=self._setpoint_confirm(
-                    "heating_setpoint", tt_low, self.device.get_heating_setpoint
-                ),
-            )
+            await self._async_set_heating_setpoint(tt_low)
 
     @property
     def fan_mode(self):

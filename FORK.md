@@ -179,6 +179,19 @@ reloads stop stacking listeners; unload uses `async_unload_platforms`; and
 matters because reloading the config entry (~1s) is the recommended recovery,
 in place of power-cycling the hub (1–3 minutes).
 
+### 9. `climate.set_temperature` ignored `hvac_mode`
+
+Home Assistant passes `hvac_mode` to `async_set_temperature` instead of calling
+`async_set_hvac_mode`. It was never read, so a morning automation calling
+`set_temperature(hvac_mode: cool, temperature: 26.1)` while a SmartRent schedule
+held the thermostat in heat wrote 79°F to the *heating* setpoint and stayed in
+heat. The mode is now sent first and the setpoint follows the requested mode:
+`get_mode()` cannot be read back, since #7 made it update only on the hub's echo.
+
+Setpoints are also rounded before sending. The hub rounds what it receives
+(78.98 echoes as 79), while `_setpoint_confirm` truncated its target to 78, so a
+setpoint that really landed was logged as `confirm FAILED`.
+
 ## Why the library fixes live in the integration
 
 The `_async_send_payload` and `async_set_locked` fixes properly belong in
@@ -245,6 +258,7 @@ container rather than on the host:
 
 ```sh
 docker run --rm -v "$PWD:/src" -w /src python:3.11-slim sh -c '
+  apt-get -qq update && apt-get -qq install -y git
   pip install -q pre-commit && git config --global --add safe.directory /src
   pre-commit run --all-files'
 ```
