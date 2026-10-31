@@ -20,6 +20,9 @@ _LOGGER = logging.getLogger(__name__)
 # "the lock doesn't respond" -- the command was retried and eventually
 # confirmed correctly, just after a much longer wait than necessary.
 CONFIRM_TIMEOUT = 6.0
+# Slow echoes have landed up to 14s after the first send, so the resend gets
+# the rest of that window rather than failing a command that is still in flight.
+RESEND_CONFIRM_TIMEOUT = 10.0
 CONFIRM_POLL_INTERVAL = 0.5
 
 
@@ -108,8 +111,7 @@ class SmartrentLock(LockEntity):
             await self.device.async_set_locked(locked)
             if not await self._async_confirm(locked):
                 raise HomeAssistantError(
-                    f"{self.name}: hub did not confirm {action} within "
-                    f"{CONFIRM_TIMEOUT:.0f}s"
+                    f"{self.name}: lock did not confirm {action} after resending"
                 )
         except SmartRentError as err:
             raise HomeAssistantError(f"{self.name}: {action} failed: {err}") from err
@@ -117,12 +119,11 @@ class SmartrentLock(LockEntity):
             self._pending = None
             self.async_write_ha_state()
 
-    async def _async_confirm(self, locked: bool) -> bool:
-        """Wait for the websocket echo, falling back to an explicit REST read."""
+    async def _async_wait_for_echo(self, locked: bool, timeout: float) -> bool:
+        """Wait for the lock's own report that it reached ``locked``."""
         loop = asyncio.get_running_loop()
         started = loop.time()
-        deadline = started + CONFIRM_TIMEOUT
-        while loop.time() < deadline:
+        while loop.time() < started + timeout:
             if self.device.get_locked() is locked:
                 _LOGGER.debug(
                     "TRACE confirm OK locked=%s via websocket echo in %.1fs",
@@ -131,36 +132,37 @@ class SmartrentLock(LockEntity):
                 )
                 return True
             await asyncio.sleep(CONFIRM_POLL_INTERVAL)
+        return False
 
-        # The updater websocket may be mid-reconnect, so ask the REST endpoint
-        # rather than reporting a failure we are not sure about. Also check
-        # whether the hub itself is reachable from SmartRent's cloud at all --
-        # if it's not, that would affect the official app too, and is not
-        # something this integration caused or can fix by itself.
+    async def _async_confirm(self, locked: bool) -> bool:
+        """Wait for the websocket echo, resending the command once without it.
+
+        REST cannot stand in for the echo: SmartRent's cloud reports the
+        requested value once it accepts a command, even if the lock never
+        moved. Resending is safe because the command is idempotent.
+        """
+        if await self._async_wait_for_echo(locked, CONFIRM_TIMEOUT):
+            return True
+
+        # Also record whether the hub itself is reachable from SmartRent's
+        # cloud -- if it's not, that would affect the official app too, and is
+        # not something this integration caused or can fix by itself.
         _LOGGER.warning(
-            "TRACE confirm no websocket echo for locked=%s after %.0fs "
-            "(updater socket may be down) -- falling back to REST",
+            "TRACE confirm no websocket echo for locked=%s after %.0fs -- resending",
             locked,
             CONFIRM_TIMEOUT,
         )
         await async_log_hub_status(
             self.device._client, context=f"confirm-timeout locked={locked}"
         )
-        try:
-            await self.device._async_fetch_state()
-        except (SmartRentError, OSError) as err:
-            _LOGGER.warning("TRACE confirm REST read failed: %s", err)
-            return False
+        await self.device.async_set_locked(locked)
+        if await self._async_wait_for_echo(locked, RESEND_CONFIRM_TIMEOUT):
+            return True
 
-        confirmed = self.device.get_locked() is locked
-        _LOGGER.log(
-            logging.DEBUG if confirmed else logging.ERROR,
-            "TRACE confirm %s locked=%s via REST (reported %s)",
-            "OK" if confirmed else "FAILED",
-            locked,
-            self.device.get_locked(),
+        _LOGGER.error(
+            "TRACE confirm FAILED locked=%s -- no echo after resending", locked
         )
-        return confirmed
+        return False
 
     @property
     def device_info(self):

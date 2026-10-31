@@ -1,7 +1,7 @@
 """Platform for climate integration."""
 import asyncio
 import logging
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import (
@@ -31,6 +31,7 @@ _LOGGER = logging.getLogger(__name__)
 # can get a clean "ok" from the cloud and never reach the hardware if the hub
 # itself is unresponsive.
 CONFIRM_TIMEOUT = 6.0
+RESEND_CONFIRM_TIMEOUT = 10.0
 CONFIRM_POLL_INTERVAL = 0.5
 
 HA_HVAC_MODE_TO_SMARTRENT = {
@@ -70,6 +71,7 @@ class SmartrentThermostat(ClimateEntity):
     def __init__(self, thermo: Thermostat) -> None:
         super().__init__()
         self.device = thermo
+        self._latest_command: dict[str, object] = {}
 
         self.device.start_updater()
         self.device.set_update_callback(self.async_schedule_update_ha_state)
@@ -181,33 +183,59 @@ class SmartrentThermostat(ClimateEntity):
     async def _async_send(
         self,
         what: str,
-        coro,
+        send: Callable[[], Awaitable[None]],
         confirm: Optional[
             tuple[Callable[[], object], object, Callable[[object], str]]
         ] = None,
     ) -> None:
-        """Await a device setter, surfacing delivery failures to the caller.
+        """Send a command, surfacing delivery failures to the caller.
 
         ``confirm``, if given, is ``(getter, target, describe)``: a
-        background task polls ``getter()`` against ``target`` and logs
-        loudly -- with hub status -- if the hub never actually applied the
-        change, without blocking this call.
+        background task polls ``getter()`` against ``target``, resends once
+        without an echo, and logs loudly -- with hub status -- if the hub
+        still never applied the change, without blocking this call.
         """
+        baseline = confirm[0]() if confirm else None
+        command = object()
+        self._latest_command[what.partition("=")[0]] = command
         try:
-            await coro
+            await send()
         except SmartRentError as err:
             raise HomeAssistantError(f"{self.name}: {what} failed: {err}") from err
 
         if confirm is not None:
             getter, target, describe = confirm
             self.hass.async_create_task(
-                self._async_confirm_background(what, getter, target, describe),
+                self._async_confirm_background(
+                    what, send, command, baseline, getter, target, describe
+                ),
                 name=f"smartrent confirm {what}",
             )
+
+    @staticmethod
+    async def _async_wait_for_echo(
+        what: str, getter: Callable[[], object], target: object, timeout: float
+    ) -> bool:
+        """Wait for the hub's own report that ``getter()`` reached ``target``."""
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        while loop.time() < started + timeout:
+            if getter() == target:
+                _LOGGER.debug(
+                    "TRACE confirm OK %s via websocket echo in %.1fs",
+                    what,
+                    loop.time() - started,
+                )
+                return True
+            await asyncio.sleep(CONFIRM_POLL_INTERVAL)
+        return False
 
     async def _async_confirm_background(
         self,
         what: str,
+        send: Callable[[], Awaitable[None]],
+        command: object,
+        baseline: object,
         getter: Callable[[], object],
         target: object,
         describe: Callable[[object], str],
@@ -216,47 +244,42 @@ class SmartrentThermostat(ClimateEntity):
 
         SmartRent's cloud can acknowledge a command the physical hub never
         applies -- the delivery check in patches.py only confirms the cloud
-        accepted it, not that the hardware moved. This is what catches that.
+        accepted it, not that the hardware moved. REST cannot settle it either,
+        since the cloud reports the requested value until the hub overrides it.
         """
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        deadline = started + CONFIRM_TIMEOUT
-        while loop.time() < deadline:
-            if getter() == target:
-                _LOGGER.debug(
-                    "TRACE confirm OK %s via websocket echo in %.1fs",
-                    what,
-                    loop.time() - started,
-                )
-                return
-            await asyncio.sleep(CONFIRM_POLL_INTERVAL)
+        if await self._async_wait_for_echo(what, getter, target, CONFIRM_TIMEOUT):
+            return
 
         _LOGGER.warning(
-            "TRACE confirm no websocket echo for %s after %.0fs "
-            "(updater socket may be down) -- falling back to REST",
+            "TRACE confirm no websocket echo for %s after %.0fs",
             what,
             CONFIRM_TIMEOUT,
         )
         await async_log_hub_status(
             self.device._client, context=f"confirm-timeout {what}"
         )
-        try:
-            await self.device._async_fetch_state()
-        except (SmartRentError, OSError) as err:
-            _LOGGER.error("TRACE confirm %s REST read failed: %s", what, err)
-            self.async_write_ha_state()
+
+        # A resend must never undo something newer: a later command for this
+        # attribute (HomeKit slider drags), or a change made at the thermostat.
+        attribute = what.partition("=")[0]
+        if self._latest_command.get(attribute) is not command or getter() != baseline:
+            _LOGGER.debug("TRACE confirm %s superseded, not resending", what)
             return
 
-        actual = getter()
-        if actual == target:
-            _LOGGER.debug("TRACE confirm OK %s via REST", what)
-        else:
+        try:
+            await send()
+        except (SmartRentError, OSError) as err:
+            _LOGGER.error("TRACE confirm FAILED %s -- resend failed: %s", what, err)
+            return
+
+        if not await self._async_wait_for_echo(
+            what, getter, target, RESEND_CONFIRM_TIMEOUT
+        ):
             _LOGGER.error(
                 "TRACE confirm FAILED %s -- hub never applied it (%s)",
                 what,
-                describe(actual),
+                describe(getter()),
             )
-        self.async_write_ha_state()
 
     async def async_set_hvac_mode(self, hvac_mode):
         """Set new target operation mode."""
@@ -264,7 +287,7 @@ class SmartrentThermostat(ClimateEntity):
 
         await self._async_send(
             f"hvac_mode={hvac_mode}",
-            self.device.async_set_mode(smartrent_hvac_mode),
+            lambda: self.device.async_set_mode(smartrent_hvac_mode),
             confirm=(
                 self.device.get_mode,
                 smartrent_hvac_mode,
@@ -294,7 +317,7 @@ class SmartrentThermostat(ClimateEntity):
         value = round(float(value))
         await self._async_send(
             f"cooling_setpoint={value}",
-            self.device.async_set_cooling_setpoint(value),
+            lambda: self.device.async_set_cooling_setpoint(value),
             confirm=self._setpoint_confirm(
                 "cooling_setpoint", value, self.device.get_cooling_setpoint
             ),
@@ -304,7 +327,7 @@ class SmartrentThermostat(ClimateEntity):
         value = round(float(value))
         await self._async_send(
             f"heating_setpoint={value}",
-            self.device.async_set_heating_setpoint(value),
+            lambda: self.device.async_set_heating_setpoint(value),
             confirm=self._setpoint_confirm(
                 "heating_setpoint", value, self.device.get_heating_setpoint
             ),
@@ -351,7 +374,7 @@ class SmartrentThermostat(ClimateEntity):
 
         await self._async_send(
             f"fan_mode={fan_mode}",
-            self.device.async_set_fan_mode(smartrent_fan_mode),
+            lambda: self.device.async_set_fan_mode(smartrent_fan_mode),
             confirm=(
                 self.device.get_fan_mode,
                 smartrent_fan_mode,

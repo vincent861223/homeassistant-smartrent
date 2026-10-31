@@ -192,6 +192,32 @@ Setpoints are also rounded before sending. The hub rounds what it receives
 (78.98 echoes as 79), while `_setpoint_confirm` truncated its target to 78, so a
 setpoint that really landed was logged as `confirm FAILED`.
 
+### 10. REST no longer confirms a command; a missing echo gets one resend
+
+The REST fallback in #6 and #7 turned out to prove nothing. On arrival a lock
+unlock was accepted by the cloud with no echo, and REST reported `locked: false`
+while the lock had not moved, so HA logged `confirm OK` and showed unlocked until
+the user typed the code 30s later. The updater websocket was connected the whole
+time. A thermostat setpoint the same day read back 79 from REST, then 86 seven
+minutes later with no echo in between: the cloud appears to report the requested
+value until the hub says otherwise.
+
+Without an echo inside `CONFIRM_TIMEOUT` the command is now resent once, with
+`RESEND_CONFIRM_TIMEOUT` for the slower echoes seen in production (up to 14s).
+Still no echo means failure: the lock raises `HomeAssistantError` and the
+thermostat logs at ERROR. So if the updater socket is truly down, a command that
+worked is reported as failed until the next poll, which is the honest direction
+to be wrong in.
+
+The thermostat's resend is skipped if a newer command for the attribute was sent
+or the value moved to something else, so it never undoes a slider drag or a
+change made at the thermostat. A periodic REST poll landing inside the wait can
+still satisfy the check; that window is ~16s in every 600s.
+
+Whether a resend helps depends on SmartRent forwarding a value its cloud already
+holds, which has not been observed either way. Look for `no websocket echo`
+followed by `confirm OK` or `confirm FAILED` to find out.
+
 ## Why the library fixes live in the integration
 
 The `_async_send_payload` and `async_set_locked` fixes properly belong in
